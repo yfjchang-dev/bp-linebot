@@ -1,0 +1,7 @@
+flask
+line-bot-sdk
+gspread
+google-auth
+apscheduler
+gunicorn
+requests
