@@ -2,12 +2,15 @@ import os
 import json
 import gspread
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage, PostbackEvent,
-    TemplateSendMessage, ConfirmTemplate, PostbackAction,
-    ButtonsTemplate, MessageAction
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, PushMessageRequest, TextMessage,
+    TemplateMessage, ConfirmTemplate, PostbackAction
+)
+from linebot.v3.webhooks import (
+    MessageEvent, TextMessageContent, PostbackEvent
 )
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,10 +25,9 @@ BP_SHEET_ID = os.environ.get("BP_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# Google Sheets 連線
 def get_sheet():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -34,13 +36,12 @@ def get_sheet():
     spreadsheet = client.open_by_key(BP_SHEET_ID)
     try:
         sheet = spreadsheet.worksheet("血壓紀錄")
-    except:
+    except Exception:
         sheet = spreadsheet.add_worksheet(title="血壓紀錄", rows=1000, cols=10)
         sheet.append_row(["日期", "早上收縮壓", "早上舒張壓", "早上脈搏", "早上服藥",
                           "晚上收縮壓", "晚上舒張壓", "晚上脈搏", "晚上服藥", "備註"])
     return sheet
 
-# 暫存使用者輸入狀態
 user_state = {}
 
 def bp_status(sys, dia):
@@ -75,6 +76,45 @@ def save_to_sheet(date_str, slot, sys, dia, pulse, took_med):
         else:
             sheet.append_row([date_str, "", "", "", "", sys, dia, pulse, med_str, ""])
 
+def reply_text(reply_token, text):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)]
+            )
+        )
+
+def reply_confirm(reply_token, text, label1, data1, label2, data2):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TemplateMessage(
+                    alt_text=text,
+                    template=ConfirmTemplate(
+                        text=text,
+                        actions=[
+                            PostbackAction(label=label1, data=data1),
+                            PostbackAction(label=label2, data=data2),
+                        ]
+                    )
+                )]
+            )
+        )
+
+def push_text(user_id, text):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[TextMessage(text=text)]
+            )
+        )
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -85,27 +125,22 @@ def callback():
         abort(400)
     return "OK"
 
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-
-    # 印出 user_id 方便設定
     print(f"User ID: {user_id}")
 
     state = user_state.get(user_id, {})
 
-    # 輸入數值階段
     if state.get("step") == "input_sys":
         try:
             sys_val = int(text)
             user_state[user_id]["sys"] = sys_val
             user_state[user_id]["step"] = "input_dia"
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="請輸入舒張壓（低壓）數值："))
-        except:
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="請輸入數字，例如：120"))
+            reply_text(event.reply_token, "請輸入舒張壓（低壓）數值：")
+        except ValueError:
+            reply_text(event.reply_token, "請輸入數字，例如：120")
         return
 
     if state.get("step") == "input_dia":
@@ -113,19 +148,14 @@ def handle_message(event):
             dia_val = int(text)
             user_state[user_id]["dia"] = dia_val
             user_state[user_id]["step"] = "input_pulse"
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="請輸入脈搏（心跳）數值："))
-        except:
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="請輸入數字，例如：72"))
+            reply_text(event.reply_token, "請輸入脈搏（心跳）數值：")
+        except ValueError:
+            reply_text(event.reply_token, "請輸入數字，例如：72")
         return
 
     if state.get("step") == "input_pulse":
         try:
             pulse_val = int(text)
-            user_state[user_id]["pulse"] = pulse_val
-
-            # 儲存
             tz = pytz.timezone("Asia/Taipei")
             now = datetime.now(tz)
             date_str = now.strftime("%Y/%m/%d")
@@ -150,35 +180,25 @@ def handle_message(event):
 
 判斷：{status}"""
 
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            reply_text(event.reply_token, reply)
             user_state.pop(user_id, None)
-        except:
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="請輸入數字，例如：72"))
+        except ValueError:
+            reply_text(event.reply_token, "請輸入數字，例如：72")
         return
 
-    # 主選單
     if text in ["早上量血壓", "晚上量血壓", "早上", "晚上"]:
         slot = "morning" if "早" in text else "evening"
         user_state[user_id] = {"slot": slot}
-
         slot_str = "🌅 早上" if slot == "morning" else "🌙 晚上"
-        confirm = TemplateSendMessage(
-            alt_text="今天有吃血壓藥嗎？",
-            template=ConfirmTemplate(
-                text=f"{slot_str} 量血壓\n\n💊 今天有吃血壓藥嗎？",
-                actions=[
-                    PostbackAction(label="✅ 有吃", data=f"med=yes&user={user_id}"),
-                    PostbackAction(label="❌ 沒吃", data=f"med=no&user={user_id}"),
-                ]
-            )
+        reply_confirm(
+            event.reply_token,
+            f"{slot_str} 量血壓\n\n💊 今天有吃血壓藥嗎？",
+            "✅ 有吃", f"med=yes&user={user_id}",
+            "❌ 沒吃", f"med=no&user={user_id}"
         )
-        line_bot_api.reply_message(event.reply_token, confirm)
         return
 
-    # 預設回覆
-    line_bot_api.reply_message(event.reply_token,
-        TextSendMessage(text='請點選「🌅 早上量血壓」或「🌙 晚上量血壓」開始記錄！'))
+    reply_text(event.reply_token, '請點選「🌅 早上量血壓」或「🌙 晚上量血壓」開始記錄！')
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
@@ -191,10 +211,8 @@ def handle_postback(event):
         user_state[user_id]["step"] = "input_sys"
 
     med_str = "✅ 有吃" if took_med else "❌ 沒吃"
-    line_bot_api.reply_message(event.reply_token,
-        TextSendMessage(text=f"💊 {med_str}\n\n請輸入收縮壓（高壓）數值："))
+    reply_text(event.reply_token, f"💊 {med_str}\n\n請輸入收縮壓（高壓）數值：")
 
-# 推播提醒
 def send_reminder(slot):
     if not LINE_USER_ID:
         return
@@ -204,7 +222,6 @@ def send_reminder(slot):
 
     if user_state.get(last_date_key) == today:
         return
-
     user_state[last_date_key] = today
 
     if slot == "morning":
@@ -212,9 +229,8 @@ def send_reminder(slot):
     else:
         msg = "🌙 晚安！\n\n晚上 8:00 量血壓時間到了！\n\n請回覆「晚上量血壓」開始記錄 💪"
 
-    line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=msg))
+    push_text(LINE_USER_ID, msg)
 
-# 排程
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 scheduler.add_job(lambda: send_reminder("morning"), "cron", hour=8, minute=50)
 scheduler.add_job(lambda: send_reminder("evening"), "cron", hour=19, minute=50)
