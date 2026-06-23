@@ -77,12 +77,12 @@ requests_body = {
                         }
                     },
                     "position": {
-                        "newSheet": False,
                         "overlayPosition": {
                             "anchorCell": {"sheetId": trend_sheet_id, "rowIndex": 1, "columnIndex": 6},
                             "widthPixels": 900,
                             "heightPixels": 450
                         }
+                    }
                     }
                 }
             }
